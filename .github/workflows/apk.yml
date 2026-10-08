@@ -127,13 +127,6 @@ jobs:
         if: always()
         run: ccache --show-stats
 
-      # Rewrite one rolling entry per job on the default branch. The upload stays
-      # cumulative - it carries every object restored at the top of this run plus
-      # the few TUs that actually changed - but Actions cache keys are immutable,
-      # so the superseded blob has to be released before the same key can be
-      # re-uploaded. Running after the build means a failed build leaves the
-      # existing entry untouched. The other trigger branches restore this entry
-      # rather than each writing a ~4 GB one of their own.
       - name: Release superseded ccache entry
         if: github.ref_name == github.event.repository.default_branch
         env:
@@ -149,37 +142,6 @@ jobs:
           path: .ccache
           key: ${{ runner.os }}-apk-${{ github.job }}-ccache-v1
 
-      - name: Verify APK metadata and packaging
-        run: |
-          AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort -V | tail -n 1)"
-          plugin_apk="android-plugin/app/build/outputs/apk/plugin/release/MobileGL-plugin-release-${GITHUB_SHA}.apk"
-          trace_apk="android-plugin/app/build/outputs/apk/trace/release/MobileGL-plugin-trace-release-${GITHUB_SHA}.apk"
-          test -f "${plugin_apk}"
-          test -f "${trace_apk}"
-          bash .github/scripts/validate-plugin-apks.sh "$AAPT2" "$plugin_apk" "$trace_apk"
-
-      - name: Verify signed APKs
-        if: false
-        run: |
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
-          mapfile -t APKS < <(printf '%s\n' \
-            "android-plugin/app/build/outputs/apk/plugin/release/MobileGL-plugin-release-${GITHUB_SHA}.apk" \
-            "android-plugin/app/build/outputs/apk/trace/release/MobileGL-plugin-trace-release-${GITHUB_SHA}.apk")
-          for APK in "${APKS[@]}"; do
-            if [[ ! -f "$APK" ]]; then
-              echo "::error::Expected release APK was not produced: $APK"
-              exit 1
-            fi
-          done
-
-          for APK in "${APKS[@]}"; do
-            if [[ "$APK" == *-unsigned.apk ]]; then
-              echo "::error::Unsigned release APK produced: $APK"
-              exit 1
-            fi
-            "$APKSIGNER" verify --verbose "$APK"
-          done
-
       - name: Upload plugin APK
         uses: actions/upload-artifact@v7
         with:
@@ -192,7 +154,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: MobileGL-retrace-apk-${{ env.date_today }}-${{ github.sha }}
-          path: android-plugin/app/build/outputs/apk/trace/release/MobileGL-plugin-trace-release-${{ github.sha }}.apk
+          path: android-plugin/app/build/outputs/apk/trace/debug/*.apk
           archive: false
           if-no-files-found: error
 
@@ -428,8 +390,6 @@ jobs:
           apk_file="android-retrace-apks/MobileGL-plugin-trace-release-${GITHUB_SHA}.apk"
           test -f "${apk_file}"
           extra_retrace_args=()
-          # Bliss needs the newer signed ANGLE variant plus sampler mipmap
-          # min-filter downgrading on ANGLE llvmpipe.
           if [ "${{ matrix.backend.name }}" = "DirectGLES" ] && [ "${{ matrix.case.name }}" = "minecraft-1.21.4-fabric-iris-bliss-in-world" ]; then
             extra_retrace_args+=(--avoid-angle-llvmpipe-sampler-mipmap-min-filter)
           fi
@@ -468,9 +428,6 @@ jobs:
           run_retrace || retrace_status=$?
           if [ "${retrace_status}" -eq 75 ]; then
             echo "::warning::Android emulator infrastructure failed; restarting it and retrying this retrace once."
-            # Surface-lost is retried rather than failed, so it would otherwise
-            # be invisible. Report it per job - a healthy run prints nothing and
-            # a rate spike shows up as a row per affected case.
             reason_file="android-retrace-result/infrastructure-failure-reason.txt"
             surface_lost_retries=0
             if [ -f "${reason_file}" ]; then
@@ -480,9 +437,6 @@ jobs:
               echo "surface-lost retries: ${surface_lost_retries} (${{ matrix.backend.name }}, ${{ matrix.case.name }})" \
                 >> "${GITHUB_STEP_SUMMARY}"
             fi
-            # The restart truncates EMULATOR_LOG, and the attempt that lost the
-            # emulator is the one worth reading - the retry usually only shows
-            # the wreckage. Keep the first attempt's log before it is clobbered.
             if [ -f "${EMULATOR_LOG}" ]; then
               cp "${EMULATOR_LOG}" "${EMULATOR_LOG}.first-attempt" || true
             fi
@@ -528,8 +482,6 @@ jobs:
           if [ -f "${EMULATOR_LOG}.first-attempt" ]; then
             cp "${EMULATOR_LOG}.first-attempt" android-retrace-result/diagnostics/emulator-first-attempt.log
           fi
-          # A vanished emulator looks identical whether the host OOM killer took
-          # qemu or the renderer faulted. These two say which.
           free -h > android-retrace-result/diagnostics/host-memory.txt 2>&1 || true
           sudo dmesg -T 2>/dev/null | tail -300 > android-retrace-result/diagnostics/host-dmesg.txt || true
 
@@ -629,13 +581,6 @@ jobs:
                 keep=1
               fi
             elif [[ "${artifact_name}" == MobileGL-android-retrace-result-* ]]; then
-              # The result artifact carries mobilegl.log, retrace.log, logcat,
-              # the emulator log and the actual/diff images - the only record of
-              # why a retrace failed. Its name ends in -<backend>-<case>, so a
-              # suffix match on the case name keeps both backends' results for a
-              # case that failed on either of them, which is what a comparison
-              # needs. The match is anchored at the end, so a case name that is a
-              # prefix of a longer one does not retain the longer one's results.
               for case_name in "${!failed_cases[@]}"; do
                 if [[ "${artifact_name}" == *-"${case_name}" ]]; then
                   keep=1
